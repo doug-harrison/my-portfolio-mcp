@@ -8,7 +8,7 @@ dependencies = [
 ]
 
 [project.scripts]
-mcp-portfolio-server = "mcpsrv.mcp_portfolio_server:main"
+mcp-portfolio-server = "mcpsrv.surveymonkey_mcp:main"
 
 [build-system]
 requires = ["setuptools>=61"]
