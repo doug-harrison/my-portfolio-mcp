@@ -200,6 +200,111 @@ def validate_choice_ids(question: Dict[str, Any], choice_ids: List[str]) -> None
         )
 
 
+def _resolve(
+    items: List[Dict[str, Any]],
+    value: str,
+    kind: str,
+    question_id: str,
+    extra: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    Resolve a value (which may be an ID *or* the human-readable text/label of a
+    choice/row/col) to its ID. Matching is: exact ID first, then case-insensitive
+    text. ``extra`` allows the "other" choice to be matched too.
+
+    Raises a helpful error listing the valid options if there is no unique match,
+    so the calling agent can self-correct.
+    """
+    valid_ids = {i["id"] for i in items}
+    if extra and extra.get("id"):
+        valid_ids.add(extra["id"])
+    if value in valid_ids:
+        return value
+
+    norm = str(value).strip().lower()
+    matches = [i["id"] for i in items if (i.get("text") or "").strip().lower() == norm]
+    if extra and extra.get("id"):
+        if (extra.get("text") or "").strip().lower() == norm or norm in (
+            "other",
+            "other (please specify)",
+        ):
+            matches.append(extra["id"])
+
+    options = ", ".join(f"{(i.get('text') or '')!r}={i['id']}" for i in items)
+    if extra and extra.get("id"):
+        options += f", 'other'={extra['id']}"
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise ValueError(
+            f"Could not match {kind} {value!r} for question {question_id}. "
+            f"Valid options: {options}"
+        )
+    raise ValueError(
+        f"Ambiguous {kind} {value!r} for question {question_id} (matched several). "
+        f"Pass the exact ID instead. Options: {options}"
+    )
+
+
+def normalize_answer(question: Dict[str, Any], raw: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Turn a "raw" answer (which may use IDs *or* human-readable labels) into the
+    canonical, ID-based answer dict that ``build_question_answers`` consumes.
+
+    Accepted label fields (in addition to the ID fields):
+      - choice_labels: list of choice texts (resolved alongside choice_ids).
+      - row_answers items may use row / col / choice (texts) as well as
+        row_id / col_id / choice_id.
+    """
+    qid = question["id"]
+    other = question.get("other")
+
+    choice_ids = list(raw.get("choice_ids") or [])
+    for label in raw.get("choice_labels") or []:
+        choice_ids.append(_resolve(question.get("choices", []), label, "choice", qid, other))
+
+    rows_out: List[Dict[str, Any]] = []
+    for ra in raw.get("row_answers") or []:
+        item: Dict[str, Any] = {}
+        rv = ra.get("row_id") if ra.get("row_id") is not None else ra.get("row")
+        if rv is not None:
+            item["row_id"] = _resolve(question.get("rows", []), rv, "row", qid)
+        cv = ra.get("col_id") if ra.get("col_id") is not None else ra.get("col")
+        if cv is not None:
+            item["col_id"] = _resolve(question.get("cols", []), cv, "col", qid)
+        chv = ra.get("choice_id") if ra.get("choice_id") is not None else ra.get("choice")
+        if chv is not None:
+            item["choice_id"] = _resolve(question.get("choices", []), chv, "choice", qid)
+        if ra.get("text") is not None:
+            item["text"] = ra["text"]
+        rows_out.append(item)
+
+    return {
+        "answer_text": raw.get("answer_text"),
+        "choice_ids": choice_ids or None,
+        "row_answers": rows_out or None,
+        "other_id": raw.get("other_id"),
+        "other_text": raw.get("other_text"),
+    }
+
+
+def _store_answer(draft: Dict[str, Any], raw: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Resolve + validate + store one answer on the draft (in memory only; the
+    caller is responsible for persisting via DRAFTS.save). Returns the canonical
+    answer that was stored.
+    """
+    qid = raw.get("question_id")
+    if not qid:
+        raise ValueError("Each answer must include a 'question_id'.")
+    question = find_question(draft, qid)
+    normalized = normalize_answer(question, raw)
+    build_question_answers(question, normalized)  # validate before storing
+    draft["answers"][qid] = normalized
+    draft["confirmed"] = False
+    return normalized
+
+
 def build_question_answers(
     question: Dict[str, Any], answer: Dict[str, Any]
 ) -> List[Dict[str, Any]]:
@@ -390,38 +495,43 @@ def save_answer(
     question_id: str,
     answer_text: Optional[str] = None,
     choice_ids: Optional[List[str]] = None,
+    choice_labels: Optional[List[str]] = None,
     row_answers: Optional[List[Dict[str, str]]] = None,
     other_id: Optional[str] = None,
     other_text: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Save one answer to the local draft.
+    Save ONE answer to the local draft.
 
-    - answer_text: free text (open ended / essay / slider).
-    - choice_ids: single or multiple choice selections.
+    You may answer using IDs or the human-readable text/labels from load_survey
+    (the server resolves labels to IDs for you):
+
+    - answer_text: free text (open ended / essay / slider / numerical / date).
+    - choice_ids: single/multiple choice selections by ID.
+    - choice_labels: single/multiple choice selections by their text (e.g.
+      ["Strongly agree"]) — resolved to IDs automatically.
     - other_text (+ optional other_id): the "Other (please specify)" write-in.
-    - row_answers: matrix questions. Each item may combine row_id / col_id /
-      choice_id / text, e.g.
-        matrix single/rating: [{"row_id": "...", "choice_id": "..."}]
-        matrix menu:          [{"row_id": "...", "col_id": "...", "choice_id": "..."}]
-        matrix open-ended:    [{"row_id": "...", "text": "..."}]
+    - row_answers: matrix questions. Each item may use IDs or labels:
+        matrix single/rating: [{"row": "Speed", "choice": "Good"}]
+                           or [{"row_id": "...", "choice_id": "..."}]
+        matrix menu:          [{"row": "...", "col": "...", "choice": "..."}]
+        matrix open-ended:    [{"row": "...", "text": "..."}]
+
+    To save many answers at once, prefer save_answers.
     """
     draft = DRAFTS.get(draft_id)
-    question = find_question(draft, question_id)
-
-    answer = {
-        "answer_text": answer_text,
-        "choice_ids": choice_ids,
-        "row_answers": row_answers,
-        "other_id": other_id,
-        "other_text": other_text,
-    }
-
-    # Validate now, before storing.
-    build_question_answers(question, answer)
-
-    draft["answers"][question_id] = answer
-    draft["confirmed"] = False
+    _store_answer(
+        draft,
+        {
+            "question_id": question_id,
+            "answer_text": answer_text,
+            "choice_ids": choice_ids,
+            "choice_labels": choice_labels,
+            "row_answers": row_answers,
+            "other_id": other_id,
+            "other_text": other_text,
+        },
+    )
     DRAFTS.save(draft)
 
     return {
@@ -429,6 +539,59 @@ def save_answer(
         "question_id": question_id,
         "saved": True,
         "message": "Answer saved. Review response before submission.",
+    }
+
+
+@mcp.tool()
+def save_answers(draft_id: str, answers: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Save MANY answers in one call (preferred over repeated save_answer).
+
+    Each item in ``answers`` is an object with a ``question_id`` plus the same
+    fields save_answer accepts (answer_text / choice_ids / choice_labels /
+    row_answers / other_id / other_text). IDs or human-readable labels both work.
+
+    Example:
+        save_answers(draft_id, answers=[
+            {"question_id": "111", "answer_text": "Jane Doe"},
+            {"question_id": "222", "choice_labels": ["Yes"]},
+            {"question_id": "333", "row_answers": [
+                {"row": "Support", "choice": "Excellent"},
+                {"row": "Price",   "choice": "Fair"}
+            ]}
+        ])
+
+    Each answer is validated independently: valid ones are saved even if others
+    fail, and the result lists per-question success/error plus which required
+    questions are still missing — so you can fix and re-send only the failures.
+    """
+    draft = DRAFTS.get(draft_id)
+
+    results: List[Dict[str, Any]] = []
+    saved = 0
+    for raw in answers or []:
+        qid = raw.get("question_id")
+        try:
+            _store_answer(draft, raw)
+            saved += 1
+            results.append({"question_id": qid, "saved": True})
+        except Exception as exc:  # surface a fixable error per question
+            results.append({"question_id": qid, "saved": False, "error": str(exc)})
+
+    DRAFTS.save(draft)
+    missing = get_missing_required_questions(draft)
+
+    return {
+        "draft_id": draft_id,
+        "saved_count": saved,
+        "total": len(answers or []),
+        "results": results,
+        "missing_required_questions": missing,
+        "ready_to_submit": len(missing) == 0,
+        "message": (
+            "Saved answers. Review failures (if any) and re-send only those, "
+            "then call review_response before submitting."
+        ),
     }
 
 

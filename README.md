@@ -69,12 +69,18 @@ SURVEYMONKEY_ACCESS_TOKEN=xxx python -m mcpsrv.mcp_portfolio_server
 ## Tools exposed
 
 `list_surveys`, `list_collectors`, `load_survey`, `start_response`,
-`save_answer`, `review_response`, `submit_response`, `get_submitted_response`.
+`save_answer`, `save_answers`, `review_response`, `submit_response`,
+`get_submitted_response`.
 
-The flow is draft-based: `start_response` → `save_answer` (per question) →
-`review_response` → `submit_response(user_confirmed=True)`. Submission is a single
-`POST /collectors/{id}/responses` with the full `pages` payload and
-`response_status="completed"`.
+The flow is draft-based: `start_response` → `save_answers` (bulk; or `save_answer`
+per question) → `review_response` → `submit_response(user_confirmed=True)`.
+Submission is a single `POST /collectors/{id}/responses` with the full `pages`
+payload and `response_status="completed"`.
+
+Answers may be given by ID **or** by the human-readable choice/row/col text from
+`load_survey` — the server resolves labels to IDs (case-insensitive) and, on a
+non-match, returns an error listing the valid options. `save_answers` validates
+each answer independently, so valid ones persist even when others fail.
 
 ## Adding more tools
 
