@@ -1,14 +1,15 @@
 [project]
 name = "my-portfolio-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "Portfolio MCP server for Dataiku agent tools"
 requires-python = ">=3.10"
 dependencies = [
     "fastmcp",
+    "requests",
 ]
 
 [project.scripts]
-mcp-portfolio-server = "mcpsrv.surveymonkey_mcp:main"
+mcp-portfolio-server = "mcpsrv.mcp_portfolio_server:main"
 
 [build-system]
 requires = ["setuptools>=61"]

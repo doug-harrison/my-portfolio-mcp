@@ -1,18 +1,35 @@
 # my-portfolio-mcp
 
-A FastMCP server packaged so it installs into a Dataiku code env's `site-packages`,
-which is both readable by the impersonated run-as user and on `PYTHONPATH`.
+A FastMCP server (SurveyMonkey response toolkit) packaged so it installs into a
+Dataiku code env's `site-packages`, which is both readable by the impersonated
+run-as user and on `PYTHONPATH`.
 
 ## Layout
 
 ```
-my_portfolio_mcp/
+my-portfolio-mcp/
 ├── pyproject.toml
 ├── README.md
 └── mcpsrv/
     ├── __init__.py
-    └── mcp_portfolio_server.py
+    └── mcp_portfolio_server.py    # the one and only server module
 ```
+
+> Note: there is a single server module. (A previous version shipped two
+> divergent copies — `mcp_portfolio_server.py` and `surveymonkey_mcp.py` — which
+> caused Dataiku to run the older, buggy copy. They have been consolidated.)
+
+## Required environment variables
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `SURVEYMONKEY_ACCESS_TOKEN` | yes | Bearer token; the server refuses to start without it. |
+| `SURVEYMONKEY_BASE_URL` | no | Defaults to `https://api.surveymonkey.com/v3`. |
+| `REQUIRE_EXPLICIT_CONFIRMATION` | no | Defaults to `true`; `submit_response` then requires `user_confirmed=True`. |
+| `SURVEYMONKEY_DRAFT_DIR` | no | Directory (e.g. a Dataiku managed-folder path) for persisting drafts to JSON so a `draft_id` survives process restarts / multiple workers. If unset, drafts are in-memory only. |
+| `LOG_LEVEL` | no | Defaults to `INFO`. |
+
+Set these on the Dataiku code env / agent tool, not in the repo.
 
 ## Install into the Dataiku code env
 
@@ -34,16 +51,30 @@ my_portfolio_mcp/
   - `-m`
   - `mcpsrv.mcp_portfolio_server`
 
-That's it. Because the package is now in `site-packages`, `-m` resolves it and the
-file is readable — clearing both the `ModuleNotFoundError` and the `Errno 13`
-permission error.
+Because the package is now in `site-packages`, `-m` resolves it and the file is
+readable — clearing both the `ModuleNotFoundError` and the `Errno 13` permission
+error.
+
+Equivalently, the installed console script `mcp-portfolio-server` runs the same
+`main()` entry point.
 
 ## Local sanity check (optional)
 
 ```
 pip install -e .
-python -m mcpsrv.mcp_portfolio_server   # should start and wait on stdin; Ctrl-C to exit
+SURVEYMONKEY_ACCESS_TOKEN=xxx python -m mcpsrv.mcp_portfolio_server
+# should start and wait on stdin; Ctrl-C to exit
 ```
+
+## Tools exposed
+
+`list_surveys`, `list_collectors`, `load_survey`, `start_response`,
+`save_answer`, `review_response`, `submit_response`, `get_submitted_response`.
+
+The flow is draft-based: `start_response` → `save_answer` (per question) →
+`review_response` → `submit_response(user_confirmed=True)`. Submission is a single
+`POST /collectors/{id}/responses` with the full `pages` payload and
+`response_status="completed"`.
 
 ## Adding more tools
 

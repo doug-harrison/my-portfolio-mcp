@@ -3,20 +3,23 @@ import json
 import uuid
 import time
 import logging
-from typing import Any, Dict, List, Optional, Literal
+from typing import Any, Dict, List, Optional
 
 import requests
 from fastmcp import FastMCP
-from pydantic import BaseModel, Field
-
 
 # ----------------------------
 # Basic config
 # ----------------------------
-
 BASE_URL = os.getenv("SURVEYMONKEY_BASE_URL", "https://api.surveymonkey.com/v3")
 ACCESS_TOKEN = os.getenv("SURVEYMONKEY_ACCESS_TOKEN")
-REQUIRE_EXPLICIT_CONFIRMATION = os.getenv("REQUIRE_EXPLICIT_CONFIRMATION", "true").lower() == "true"
+REQUIRE_EXPLICIT_CONFIRMATION = (
+    os.getenv("REQUIRE_EXPLICIT_CONFIRMATION", "true").lower() == "true"
+)
+# Optional: directory for persisting drafts so they survive process restarts /
+# multiple workers (e.g. a Dataiku managed folder path). If unset, drafts are
+# kept in memory only.
+DRAFT_DIR = os.getenv("SURVEYMONKEY_DRAFT_DIR")
 
 if not ACCESS_TOKEN:
     raise RuntimeError("Missing SURVEYMONKEY_ACCESS_TOKEN")
@@ -28,26 +31,64 @@ mcp = FastMCP("surveymonkey-response-toolkit")
 
 
 # ----------------------------
-# In-memory state
-# For production: replace with Redis, Dataiku dataset, or managed folder JSON.
+# Draft store
+# In-memory by default; optionally persisted to JSON files on disk so that
+# a draft_id created in one process/worker is usable in another.
 # ----------------------------
+class DraftStore:
+    def __init__(self, directory: Optional[str] = None):
+        self.directory = directory
+        self._mem: Dict[str, Dict[str, Any]] = {}
+        if self.directory:
+            os.makedirs(self.directory, exist_ok=True)
 
-DRAFTS: Dict[str, Dict[str, Any]] = {}
+    def _path(self, draft_id: str) -> str:
+        return os.path.join(self.directory, f"{draft_id}.json")
+
+    def __contains__(self, draft_id: str) -> bool:
+        if draft_id in self._mem:
+            return True
+        if self.directory:
+            return os.path.exists(self._path(draft_id))
+        return False
+
+    def get(self, draft_id: str) -> Dict[str, Any]:
+        if draft_id in self._mem:
+            return self._mem[draft_id]
+        if self.directory and os.path.exists(self._path(draft_id)):
+            with open(self._path(draft_id), "r", encoding="utf-8") as fh:
+                draft = json.load(fh)
+            self._mem[draft_id] = draft
+            return draft
+        raise ValueError(f"Unknown draft_id: {draft_id}")
+
+    def save(self, draft: Dict[str, Any]) -> None:
+        draft_id = draft["draft_id"]
+        self._mem[draft_id] = draft
+        if self.directory:
+            tmp = self._path(draft_id) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(draft, fh)
+            os.replace(tmp, self._path(draft_id))
+
+
+DRAFTS = DraftStore(DRAFT_DIR)
 
 
 # ----------------------------
 # SurveyMonkey API client
 # ----------------------------
-
 class SurveyMonkeyClient:
     def __init__(self, base_url: str, token: str):
         self.base_url = base_url.rstrip("/")
         self.session = requests.Session()
-        self.session.headers.update({
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        })
+        self.session.headers.update(
+            {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            }
+        )
 
     def request(
         self,
@@ -64,9 +105,9 @@ class SurveyMonkeyClient:
             json=json_body,
             timeout=60,
         )
-
         if response.status_code == 429:
             retry_after = int(response.headers.get("Retry-After", "2"))
+            logger.warning("Rate limited by SurveyMonkey; retrying in %ss", retry_after)
             time.sleep(retry_after)
             response = self.session.request(
                 method=method,
@@ -75,12 +116,10 @@ class SurveyMonkeyClient:
                 json=json_body,
                 timeout=60,
             )
-
         if not response.ok:
             raise RuntimeError(
                 f"SurveyMonkey API error {response.status_code}: {response.text}"
             )
-
         return response.json() if response.text else {}
 
 
@@ -88,74 +127,48 @@ client = SurveyMonkeyClient(BASE_URL, ACCESS_TOKEN)
 
 
 # ----------------------------
-# Models
-# ----------------------------
-
-class SaveAnswerInput(BaseModel):
-    draft_id: str
-    question_id: str
-    answer_text: Optional[str] = None
-    choice_ids: Optional[List[str]] = None
-    row_answers: Optional[List[Dict[str, str]]] = None
-
-
-# ----------------------------
 # Helpers
 # ----------------------------
-
 def normalize_survey(details: Dict[str, Any]) -> Dict[str, Any]:
     pages = []
-
     for page in details.get("pages", []):
         norm_page = {
             "id": page.get("id"),
             "title": page.get("title"),
-            "questions": []
+            "questions": [],
         }
-
         for q in page.get("questions", []):
             answers = q.get("answers", {}) or {}
-
             norm_q = {
                 "id": q.get("id"),
                 "heading": (q.get("headings") or [{}])[0].get("heading"),
                 "family": q.get("family"),
                 "subtype": q.get("subtype"),
-                "required": q.get("required", False),
+                "required": bool(q.get("required", False)),
                 "choices": [
-                    {
-                        "id": c.get("id"),
-                        "text": c.get("text"),
-                        "position": c.get("position")
-                    }
+                    {"id": c.get("id"), "text": c.get("text"), "position": c.get("position")}
                     for c in answers.get("choices", [])
                 ],
+                "other": (
+                    {"id": answers["other"].get("id"), "text": answers["other"].get("text")}
+                    if isinstance(answers.get("other"), dict)
+                    else None
+                ),
                 "rows": [
-                    {
-                        "id": r.get("id"),
-                        "text": r.get("text"),
-                        "position": r.get("position")
-                    }
+                    {"id": r.get("id"), "text": r.get("text"), "position": r.get("position")}
                     for r in answers.get("rows", [])
                 ],
                 "cols": [
-                    {
-                        "id": c.get("id"),
-                        "text": c.get("text"),
-                        "position": c.get("position")
-                    }
+                    {"id": c.get("id"), "text": c.get("text"), "position": c.get("position")}
                     for c in answers.get("cols", [])
                 ],
             }
-
             norm_page["questions"].append(norm_q)
-
         pages.append(norm_page)
-
     return {
         "survey_id": details.get("id"),
         "title": details.get("title"),
-        "pages": pages
+        "pages": pages,
     }
 
 
@@ -177,105 +190,130 @@ def find_page_for_question(draft: Dict[str, Any], question_id: str) -> str:
 
 def validate_choice_ids(question: Dict[str, Any], choice_ids: List[str]) -> None:
     valid = {c["id"] for c in question.get("choices", [])}
+    other = question.get("other")
+    if other and other.get("id"):
+        valid.add(other["id"])
     invalid = [c for c in choice_ids if c not in valid]
     if invalid:
-        raise ValueError(f"Invalid choice_id(s) for question {question['id']}: {invalid}")
+        raise ValueError(
+            f"Invalid choice_id(s) for question {question['id']}: {invalid}"
+        )
 
 
-def build_question_answers(question: Dict[str, Any], answer: Dict[str, Any]) -> List[Dict[str, Any]]:
+def build_question_answers(
+    question: Dict[str, Any], answer: Dict[str, Any]
+) -> List[Dict[str, Any]]:
     """
-    Handles common SurveyMonkey answer patterns:
-    - Open text / essay
-    - Single choice
-    - Multiple choice
-    - Matrix/rating-style row + choice answers
+    Build the SurveyMonkey ``answers`` array for one question.
 
-    For unusual survey types, add handlers here.
+    Supported answer shapes (matching the SurveyMonkey POST /responses schema):
+      - Open text / essay / slider:           answer_text
+      - Single / multiple choice:             choice_ids  (may include the "other" id)
+      - "Other" write-in text:                other_id + other_text
+      - Matrix single / rating / ranking:     row_answers = [{"row_id", "choice_id"}]
+      - Matrix menu:                          row_answers = [{"row_id", "col_id", "choice_id"}]
+      - Matrix open-ended (per-row text):     row_answers = [{"row_id", "text"}]
+
+    row_answers entries may freely combine row_id / col_id / choice_id / text;
+    each present field is validated against the survey definition.
     """
     family = question.get("family")
     subtype = question.get("subtype")
 
-    if answer.get("answer_text") is not None:
-        return [{"text": answer["answer_text"]}]
+    answers: List[Dict[str, Any]] = []
 
+    # Plain open-ended text.
+    if answer.get("answer_text") is not None:
+        answers.append({"text": answer["answer_text"]})
+
+    # Single / multiple choice selections.
     if answer.get("choice_ids"):
         validate_choice_ids(question, answer["choice_ids"])
-        return [{"choice_id": cid} for cid in answer["choice_ids"]]
+        answers.extend({"choice_id": cid} for cid in answer["choice_ids"])
 
+    # "Other" write-in (e.g. an "Other (please specify)" choice with free text).
+    if answer.get("other_text") is not None:
+        other = question.get("other")
+        other_id = answer.get("other_id") or (other.get("id") if other else None)
+        if not other_id:
+            raise ValueError(
+                f"other_text supplied but question {question['id']} has no 'other' choice"
+            )
+        answers.append({"other_id": other_id, "text": answer["other_text"]})
+
+    # Matrix / per-row answers.
     if answer.get("row_answers"):
         valid_rows = {r["id"] for r in question.get("rows", [])}
-        valid_choices = {c["id"] for c in question.get("choices", [])} | {c["id"] for c in question.get("cols", [])}
-
-        built = []
+        valid_cols = {c["id"] for c in question.get("cols", [])}
+        valid_choices = {c["id"] for c in question.get("choices", [])}
         for row_answer in answer["row_answers"]:
             row_id = row_answer.get("row_id")
+            col_id = row_answer.get("col_id")
             choice_id = row_answer.get("choice_id")
+            text = row_answer.get("text")
 
-            if row_id not in valid_rows:
-                raise ValueError(f"Invalid row_id for question {question['id']}: {row_id}")
+            if row_id is None or row_id not in valid_rows:
+                raise ValueError(
+                    f"Invalid/missing row_id for question {question['id']}: {row_id}"
+                )
+            if col_id is not None and col_id not in valid_cols:
+                raise ValueError(
+                    f"Invalid col_id for question {question['id']}: {col_id}"
+                )
+            if choice_id is not None and choice_id not in valid_choices:
+                raise ValueError(
+                    f"Invalid choice_id for question {question['id']}: {choice_id}"
+                )
 
-            if choice_id not in valid_choices:
-                raise ValueError(f"Invalid choice_id/col_id for question {question['id']}: {choice_id}")
+            built: Dict[str, Any] = {"row_id": row_id}
+            if col_id is not None:
+                built["col_id"] = col_id
+            if choice_id is not None:
+                built["choice_id"] = choice_id
+            if text is not None:
+                built["text"] = text
+            answers.append(built)
 
-            built.append({
-                "row_id": row_id,
-                "choice_id": choice_id
-            })
-
-        return built
-
-    raise ValueError(
-        f"No valid answer supplied for question {question['id']} "
-        f"family={family}, subtype={subtype}"
-    )
+    if not answers:
+        raise ValueError(
+            f"No valid answer supplied for question {question['id']} "
+            f"family={family}, subtype={subtype}"
+        )
+    return answers
 
 
 def build_submission_pages(draft: Dict[str, Any]) -> List[Dict[str, Any]]:
     pages_by_id: Dict[str, Dict[str, Any]] = {}
-
     for question_id, answer in draft["answers"].items():
         page_id = find_page_for_question(draft, question_id)
         question = find_question(draft, question_id)
-
         if page_id not in pages_by_id:
-            pages_by_id[page_id] = {
-                "id": page_id,
-                "questions": []
-            }
-
-        pages_by_id[page_id]["questions"].append({
-            "id": question_id,
-            "answers": build_question_answers(question, answer)
-        })
-
+            pages_by_id[page_id] = {"id": page_id, "questions": []}
+        pages_by_id[page_id]["questions"].append(
+            {"id": question_id, "answers": build_question_answers(question, answer)}
+        )
     return list(pages_by_id.values())
 
 
 def get_missing_required_questions(draft: Dict[str, Any]) -> List[Dict[str, str]]:
     missing = []
-
     for page in draft["survey"]["pages"]:
         for q in page["questions"]:
             if q.get("required") and q["id"] not in draft["answers"]:
-                missing.append({
-                    "question_id": q["id"],
-                    "heading": q.get("heading", "")
-                })
-
+                missing.append(
+                    {"question_id": q["id"], "heading": q.get("heading", "")}
+                )
     return missing
 
 
 # ----------------------------
 # MCP tools
 # ----------------------------
-
 @mcp.tool()
 def list_surveys(page: int = 1, per_page: int = 50) -> Dict[str, Any]:
     """List surveys visible to the authenticated SurveyMonkey account."""
     return client.request(
-        "GET",
-        "/surveys",
-        params={"page": page, "per_page": per_page},
+        "GET", "/surveys", params={"page": page, "per_page": per_page}
     )
 
 
@@ -293,11 +331,11 @@ def list_collectors(survey_id: str, page: int = 1, per_page: int = 50) -> Dict[s
 def load_survey(survey_id: str, collector_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Load and normalize a SurveyMonkey survey.
-    Returns question IDs, choices, rows, and columns needed for answering.
+    Returns question IDs, choices, rows, columns, and any "other" choice IDs
+    needed for answering.
     """
     details = client.request("GET", f"/surveys/{survey_id}/details")
     survey = normalize_survey(details)
-
     return {
         "survey": survey,
         "collector_id": collector_id,
@@ -305,7 +343,7 @@ def load_survey(survey_id: str, collector_id: Optional[str] = None) -> Dict[str,
             "Use the returned page/question/choice/row/col IDs. "
             "Ask the user each question conversationally. "
             "Call start_response before saving answers."
-        )
+        ),
     }
 
 
@@ -318,15 +356,13 @@ def start_response(
 ) -> Dict[str, Any]:
     """
     Start a local draft response.
-
     This does not submit anything to SurveyMonkey.
     """
     details = client.request("GET", f"/surveys/{survey_id}/details")
     survey = normalize_survey(details)
 
     draft_id = str(uuid.uuid4())
-
-    DRAFTS[draft_id] = {
+    draft = {
         "draft_id": draft_id,
         "survey_id": survey_id,
         "collector_id": collector_id,
@@ -338,12 +374,13 @@ def start_response(
         "submitted": False,
         "response_id": None,
     }
+    DRAFTS.save(draft)
 
     return {
         "draft_id": draft_id,
         "survey_title": survey["title"],
         "question_count": sum(len(p["questions"]) for p in survey["pages"]),
-        "message": "Draft response started. Use save_answer for each question."
+        "message": "Draft response started. Use save_answer for each question.",
     }
 
 
@@ -354,25 +391,30 @@ def save_answer(
     answer_text: Optional[str] = None,
     choice_ids: Optional[List[str]] = None,
     row_answers: Optional[List[Dict[str, str]]] = None,
+    other_id: Optional[str] = None,
+    other_text: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Save one answer to the local draft.
 
-    Use answer_text for free text.
-    Use choice_ids for single/multiple choice.
-    Use row_answers for matrix questions:
-    [{"row_id": "...", "choice_id": "..."}]
+    - answer_text: free text (open ended / essay / slider).
+    - choice_ids: single or multiple choice selections.
+    - other_text (+ optional other_id): the "Other (please specify)" write-in.
+    - row_answers: matrix questions. Each item may combine row_id / col_id /
+      choice_id / text, e.g.
+        matrix single/rating: [{"row_id": "...", "choice_id": "..."}]
+        matrix menu:          [{"row_id": "...", "col_id": "...", "choice_id": "..."}]
+        matrix open-ended:    [{"row_id": "...", "text": "..."}]
     """
-    if draft_id not in DRAFTS:
-        raise ValueError(f"Unknown draft_id: {draft_id}")
-
-    draft = DRAFTS[draft_id]
+    draft = DRAFTS.get(draft_id)
     question = find_question(draft, question_id)
 
     answer = {
         "answer_text": answer_text,
         "choice_ids": choice_ids,
         "row_answers": row_answers,
+        "other_id": other_id,
+        "other_text": other_text,
     }
 
     # Validate now, before storing.
@@ -380,37 +422,34 @@ def save_answer(
 
     draft["answers"][question_id] = answer
     draft["confirmed"] = False
+    DRAFTS.save(draft)
 
     return {
         "draft_id": draft_id,
         "question_id": question_id,
         "saved": True,
-        "message": "Answer saved. Review response before submission."
+        "message": "Answer saved. Review response before submission.",
     }
 
 
 @mcp.tool()
 def review_response(draft_id: str) -> Dict[str, Any]:
-    """
-    Review saved answers and identify missing required questions.
-    """
-    if draft_id not in DRAFTS:
-        raise ValueError(f"Unknown draft_id: {draft_id}")
-
-    draft = DRAFTS[draft_id]
+    """Review saved answers and identify missing required questions."""
+    draft = DRAFTS.get(draft_id)
     missing = get_missing_required_questions(draft)
 
     readable_answers = []
-
     for page in draft["survey"]["pages"]:
         for q in page["questions"]:
             qid = q["id"]
             if qid in draft["answers"]:
-                readable_answers.append({
-                    "question_id": qid,
-                    "heading": q.get("heading"),
-                    "answer": draft["answers"][qid],
-                })
+                readable_answers.append(
+                    {
+                        "question_id": qid,
+                        "heading": q.get("heading"),
+                        "answer": draft["answers"][qid],
+                    }
+                )
 
     return {
         "draft_id": draft_id,
@@ -421,34 +460,29 @@ def review_response(draft_id: str) -> Dict[str, Any]:
         "instruction": (
             "Show this review to the user. "
             "Only call submit_response if the user explicitly confirms."
-        )
+        ),
     }
 
 
 @mcp.tool()
-def submit_response(
-    draft_id: str,
-    user_confirmed: bool,
-) -> Dict[str, Any]:
+def submit_response(draft_id: str, user_confirmed: bool) -> Dict[str, Any]:
     """
-    Submit the draft to SurveyMonkey.
-
+    Submit the draft to SurveyMonkey in a single POST.
     The agent must pass user_confirmed=True only after explicit user approval.
     """
-    if draft_id not in DRAFTS:
-        raise ValueError(f"Unknown draft_id: {draft_id}")
-
     if REQUIRE_EXPLICIT_CONFIRMATION and not user_confirmed:
-        raise PermissionError("Explicit user confirmation is required before submission.")
+        raise PermissionError(
+            "Explicit user confirmation is required before submission."
+        )
 
-    draft = DRAFTS[draft_id]
+    draft = DRAFTS.get(draft_id)
 
     if draft["submitted"]:
         return {
             "draft_id": draft_id,
             "submitted": True,
             "response_id": draft["response_id"],
-            "message": "This draft was already submitted."
+            "message": "This draft was already submitted.",
         }
 
     missing = get_missing_required_questions(draft)
@@ -457,36 +491,29 @@ def submit_response(
 
     pages = build_submission_pages(draft)
 
-    # Create an empty response.
-    # Validate this endpoint against your collector type and SurveyMonkey plan.
+    # SurveyMonkey accepts the full response (pages + status) in a single POST to
+    # the collector. There is no PUT on /responses/{id}/details (GET only), so we
+    # do NOT split this into create-then-update.
+    payload = {
+        "response_status": "completed",
+        "pages": pages,
+        "custom_variables": draft.get("custom_variables", {}),
+    }
     created = client.request(
         "POST",
         f"/collectors/{draft['collector_id']}/responses",
-        json_body={
-            "custom_variables": draft.get("custom_variables", {})
-        }
+        json_body=payload,
     )
 
     response_id = created.get("id")
     if not response_id:
-        raise RuntimeError(f"SurveyMonkey did not return a response id: {created}")
-
-    payload = {
-        "pages": pages,
-        "custom_variables": draft.get("custom_variables", {})
-    }
-
-    # Submit response details.
-    # SurveyMonkey documents response detail retrieval under:
-    # /collectors/{collector_id}/responses/{response_id}/details
-    submitted = client.request(
-        "PUT",
-        f"/collectors/{draft['collector_id']}/responses/{response_id}/details",
-        json_body=payload,
-    )
+        raise RuntimeError(
+            f"SurveyMonkey did not return a response id: {created}"
+        )
 
     draft["submitted"] = True
     draft["response_id"] = response_id
+    DRAFTS.save(draft)
 
     return {
         "draft_id": draft_id,
@@ -494,20 +521,23 @@ def submit_response(
         "response_id": response_id,
         "survey_id": draft["survey_id"],
         "collector_id": draft["collector_id"],
-        "submission_result": submitted,
+        "submission_result": created,
     }
 
 
 @mcp.tool()
 def get_submitted_response(collector_id: str, response_id: str) -> Dict[str, Any]:
-    """
-    Retrieve submitted response details for audit/confirmation.
-    """
+    """Retrieve submitted response details for audit/confirmation."""
     return client.request(
         "GET",
         f"/collectors/{collector_id}/responses/{response_id}/details",
     )
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Console-script / ``python -m`` entry point."""
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()
